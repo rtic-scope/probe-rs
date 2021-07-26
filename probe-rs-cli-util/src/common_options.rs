@@ -1,6 +1,39 @@
-use crate::{read_metadata, ArtifactError};
+//! Collection of `#[derive(StructOpt)] struct`s common to programs that
+//! extend then functionality of cargo-flash.
+//!
+//! Example usage:
+//! ```text
+//! use structopt::StructOpt;
+//! use probe_rs_cli_util::common_options::FlashOptions;
+//!
+//! #[derive(StructOpt)]
+//! struct Opts {
+//!     #[structopt(long = "some-opt")]
+//!     opt: String,
+//!
+//!     #[structopt(flatten)]
+//!     flash_options: FlashOptions,
+//! }
+//!
+//! fn main() {
+//!     let opts = Opts::from_iter(std::env::args());
+//!
+//!     opts.flash_options.probe_options.maybe_load_chip_desc().unwrap();
+//!
+//!     // handle --list-{chips,probes}
+//!     if opts.flash_options.early_exit(std::io::stdout()).unwrap() {
+//!         return;
+//!     }
+//!
+//!     let target_session = opts.flash_options.simple_attach().unwarp();
+//!
+//!     // ...
+//! }
+//! ```
 
-use std::{fs::File, io::Write, path::Path};
+use crate::ArtifactError;
+
+use std::{fs::File, io::Write, path::Path, path::PathBuf};
 
 use probe_rs::{
     config::{RegistryError, TargetSelector},
@@ -9,6 +42,7 @@ use probe_rs::{
 };
 use structopt::StructOpt;
 
+/// Common options when flashing a target device.
 #[derive(Debug, StructOpt)]
 pub struct FlashOptions {
     #[structopt(short = "V", long = "version")]
@@ -54,13 +88,13 @@ pub struct FlashOptions {
         long = "elf",
         help = "The path to the ELF file to be flashed."
     )]
-    pub elf: Option<String>,
+    pub elf: Option<PathBuf>,
     #[structopt(
         name = "directory",
         long = "work-dir",
         help = "The work directory from which cargo-flash should operate from."
     )]
-    pub work_dir: Option<String>,
+    pub work_dir: Option<PathBuf>,
     #[structopt(flatten)]
     /// Arguments which are forwarded to 'cargo build'.
     pub cargo_options: CargoOptions,
@@ -70,6 +104,12 @@ pub struct FlashOptions {
 }
 
 impl FlashOptions {
+    /// Whether calling program should exit prematurely. Effectively
+    /// handles --list-{probes,chips}.
+    ///
+    /// If `Ok(false)` is returned, calling program should continue executing.
+    ///
+    /// Note: [ProbeOptions::maybe_load_chip_desc] should be called before this function.
     pub fn early_exit(&self, f: impl Write) -> Result<bool, OperationError> {
         if self.list_probes {
             list_connected_probes(f)?;
@@ -85,12 +125,13 @@ impl FlashOptions {
     }
 }
 
+/// Common options and logic when interfacing with a [Probe].
 #[derive(StructOpt, Debug)]
 pub struct ProbeOptions {
     #[structopt(name = "chip", long = "chip")]
     pub chip: Option<String>,
     #[structopt(name = "chip description file path", long = "chip-description-path")]
-    pub chip_description_path: Option<String>,
+    pub chip_description_path: Option<PathBuf>,
     #[structopt(name = "protocol", long = "protocol", default_value = "swd")]
     pub protocol: WireProtocol,
     #[structopt(
@@ -110,12 +151,11 @@ pub struct ProbeOptions {
     pub dry_run: bool,
 }
 
-static mut PROBE: Option<Probe> = None;
-static mut TARGET_SELECTOR: Option<TargetSelector> = None;
-
 impl ProbeOptions {
     /// Add targets contained in file given by --chip-description-path
     /// to probe-rs registery.
+    ///
+    /// Note: should be called before [FlashOptions::early_exit] and any other functions in [ProbeOptions].
     pub fn maybe_load_chip_desc(&self) -> Result<(), OperationError> {
         if let Some(ref cdp) = self.chip_description_path {
             probe_rs::config::add_target_from_yaml(&Path::new(cdp)).map_err(|error| {
@@ -129,11 +169,26 @@ impl ProbeOptions {
         }
     }
 
-    pub fn attach_to_probe(&self) -> Result<&Probe, OperationError> {
-        // Tries to open the debug probe from the given commandline
-        // arguments. This ensures that there is only one probe
-        // connected or if multiple probes are found, a single one is
-        // specified via the commandline parameters.
+    /// Resolves a resultant target selector from passed [ProbeOptions].
+    pub fn get_target_selector(&self) -> Result<TargetSelector, OperationError> {
+        let target = if let Some(chip_name) = &self.chip {
+            let target = probe_rs::config::get_target_by_name(chip_name).map_err(|error| {
+                OperationError::ChipNotFound {
+                    source: error,
+                    name: chip_name.clone(),
+                }
+            })?;
+
+            TargetSelector::Specified(target)
+        } else {
+            TargetSelector::Auto
+        };
+
+        Ok(target)
+    }
+
+    /// Attaches to specified probe and configures it.
+    pub fn attach_probe(&self) -> Result<Probe, OperationError> {
         let mut probe = {
             if self.dry_run {
                 Probe::from_specific_probe(Box::new(FakeProbe::new()));
@@ -178,19 +233,16 @@ impl ProbeOptions {
             })?;
         }
 
-        unsafe {
-            PROBE = Some(probe);
-            Ok(PROBE.as_ref().unwrap())
-        }
+        Ok(probe)
     }
 
-    pub fn attach(&self) -> Result<Session, OperationError> {
-        let probe = unsafe { PROBE.take().ok_or(OperationError::InvalidAPIOrder)? };
-        let target = unsafe {
-            TARGET_SELECTOR
-                .take()
-                .ok_or(OperationError::InvalidAPIOrder)?
-        };
+    /// Attaches to target device session. Attaches under reset if
+    /// specified by [ProbeOptions::connect_under_reset].
+    pub fn attach_session(
+        &self,
+        probe: Probe,
+        target: TargetSelector,
+    ) -> Result<Session, OperationError> {
         let session = if self.connect_under_reset {
             probe.attach_under_reset(target)
         } else {
@@ -204,54 +256,45 @@ impl ProbeOptions {
         Ok(session)
     }
 
-    pub fn get_target_selector(&self) -> Result<&TargetSelector, OperationError> {
-        let target = if let Some(chip_name) = &self.chip {
-            let target = probe_rs::config::get_target_by_name(chip_name).map_err(|error| {
-                OperationError::ChipNotFound {
-                    source: error,
-                    name: chip_name.clone(),
-                }
-            })?;
+    /// Convenience method that attaches to the specified probe, target,
+    /// and target session.
+    pub fn simple_attach(&self) -> Result<Session, OperationError> {
+        let target = self.get_target_selector()?;
+        let probe = self.attach_probe()?;
+        let session = self.attach_session(probe, target)?;
 
-            TargetSelector::Specified(target)
-        } else {
-            TargetSelector::Auto
-        };
-
-        unsafe {
-            TARGET_SELECTOR = Some(target);
-            Ok(TARGET_SELECTOR.as_ref().unwrap())
-        }
+        Ok(session)
     }
 
+    /// Builds a new flash loader for the given target and ELF. This
+    /// will check the ELF for validity and check what pages have to be
+    /// flashed etc.
     pub fn build_flashloader(
         &self,
         session: &mut Session,
         elf_path: &Path,
     ) -> Result<FlashLoader, OperationError> {
-        if let TargetSelector::Specified(ref target) = unsafe {
-            TARGET_SELECTOR
-                .as_ref()
-                .ok_or(OperationError::InvalidAPIOrder)?
-        } {
-            Ok(build_flashloader(target, elf_path)?)
-        } else {
-            Ok(build_flashloader(session.target(), elf_path)?)
-        }
-    }
+        let target = session.target();
 
-    pub fn resolve_chip(&self, work_dir: &Path) -> TargetSelector {
-        let meta = read_metadata(&work_dir).ok();
+        // Create the flash loader
+        let mut loader = FlashLoader::new(target.memory_map.to_vec(), target.source().clone());
 
-        // First use structopt, then manifest, then default to auto.
-        match (&self.chip, meta.map(|m| m.chip).flatten()) {
-            (Some(c), _) => c.into(),
-            (_, Some(c)) => c.into(),
-            _ => TargetSelector::Auto,
-        }
+        // Add data from the ELF.
+        let mut file = File::open(&elf_path).map_err(|error| OperationError::FailedToOpenElf {
+            source: error,
+            path: elf_path.to_path_buf(),
+        })?;
+
+        // Try and load the ELF data.
+        loader
+            .load_elf_data(&mut file)
+            .map_err(OperationError::FailedToLoadElfData)?;
+
+        Ok(loader)
     }
 }
 
+/// Common options used when building artifacts with cargo.
 #[derive(StructOpt, Debug)]
 pub struct CargoOptions {
     #[structopt(name = "binary", long = "bin", hidden = true)]
@@ -265,7 +308,7 @@ pub struct CargoOptions {
     #[structopt(name = "target", long = "target", hidden = true)]
     pub target: Option<String>,
     #[structopt(name = "PATH", long = "manifest-path", hidden = true)]
-    pub manifest_path: Option<String>,
+    pub manifest_path: Option<PathBuf>,
     #[structopt(long, hidden = true)]
     pub no_default_features: bool,
     #[structopt(long, hidden = true)]
@@ -275,6 +318,15 @@ pub struct CargoOptions {
 }
 
 impl CargoOptions {
+    /// Generates a suitable help string to append to your program's
+    /// --help. Example usage:
+    /// ```text
+    /// let matches = FlashOptions::clap()
+    ///     .bin_name("cargo flash")
+    ///     .after_help(CargoOptions::help_message("cargo flash").as_str())
+    ///     .get_matches_from(&args);
+    /// let opts = FlashOptions::from_clap(&matches);
+    /// ```
     pub fn help_message(bin: &str) -> String {
         format!(
             r#"
@@ -299,6 +351,9 @@ CARGO BUILD OPTIONS:
         )
     }
 
+    /// Generates list of arguments to cargo from a `CargoOptions`. For
+    /// example, if [CargoOptions::release] is set, resultant list will
+    /// contain a `"--release"`.
     pub fn to_cargo_arguments(&self) -> Vec<String> {
         let mut args: Vec<String> = vec![];
         macro_rules! maybe_push_str_opt {
@@ -317,8 +372,10 @@ CARGO BUILD OPTIONS:
             args.push("--release".to_string());
         }
         maybe_push_str_opt!(&self.bin, bin);
-        #[rustfmt::skip]
-        maybe_push_str_opt!(&self.manifest_path, manifest-path);
+        if let Some(path) = &self.manifest_path {
+            args.push("--manifest-path".to_string());
+            args.push(path.display().to_string());
+        }
         if self.no_default_features {
             args.push("--no-default-features".to_string());
         }
@@ -344,7 +401,7 @@ pub enum OperationError {
     FailedToOpenElf {
         #[source]
         source: std::io::Error,
-        path: String,
+        path: PathBuf,
     },
     #[error("Failed to load the ELF data.")]
     FailedToLoadElfData(#[source] FileDownloadError),
@@ -358,25 +415,25 @@ pub enum OperationError {
         source: FlashError,
         target: Target,
         target_spec: Option<String>,
-        path: String,
+        path: PathBuf,
     },
     #[error("Failed to parse the chip description '{path}'.")]
     FailedChipDescriptionParsing {
         #[source]
         source: RegistryError,
-        path: String,
+        path: PathBuf,
     },
     #[error("Failed to change the working directory to '{path}'.")]
     FailedToChangeWorkingDirectory {
         #[source]
         source: std::io::Error,
-        path: String,
+        path: PathBuf,
     },
     #[error("Failed to build the cargo project at '{path}'.")]
     FailedToBuildExternalCargoProject {
         #[source]
         source: ArtifactError,
-        path: String,
+        path: PathBuf,
     },
     #[error("Failed to build the cargo project.")]
     FailedToBuildCargoProject(#[source] ArtifactError),
@@ -450,24 +507,4 @@ pub fn print_families(mut f: impl Write) -> Result<(), OperationError> {
         }
     }
     Ok(())
-}
-
-/// Builds a new flash loader for the given target and ELF.
-/// This will check the ELF for validity and check what pages have to be flashed etc.
-fn build_flashloader(target: &Target, path: &Path) -> Result<FlashLoader, OperationError> {
-    // Create the flash loader
-    let mut loader = FlashLoader::new(target.memory_map.to_vec(), target.source().clone());
-
-    // Add data from the ELF.
-    let mut file = File::open(&path).map_err(|error| OperationError::FailedToOpenElf {
-        source: error,
-        path: format!("{}", path.display()),
-    })?;
-
-    // Try and load the ELF data.
-    loader
-        .load_elf_data(&mut file)
-        .map_err(OperationError::FailedToLoadElfData)?;
-
-    Ok(loader)
 }
